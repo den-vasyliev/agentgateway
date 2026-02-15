@@ -30,5 +30,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        env:
+          DOCKER_BUILDER: docker buildx build --push
         run: |
-          make docker DOCKER_REGISTRY=ghcr.io DOCKER_REPO=${{ github.repository_owner }} DOCKER_BUILDER="docker buildx build --push"
+          make docker DOCKER_REGISTRY=ghcr.io DOCKER_REPO=${{ github.repository_owner }}
