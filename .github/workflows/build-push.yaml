@@ -3,7 +3,7 @@ name: Build and Push Image
 on:
   push:
     branches:
-      - main
+      - gemini
   workflow_dispatch:
 
 env:
