@@ -54,6 +54,7 @@ pub struct Response {
 	pub model: String,
 	pub usage: Option<Usage>,
 	/// A list of chat completion choices. Can be more than one if `n` is greater than 1.
+	#[serde(default)]
 	pub choices: Vec<Choice>,
 	#[serde(flatten, default)]
 	pub rest: serde_json::Value,
@@ -93,10 +94,13 @@ pub struct UsagePromptDetails {
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Usage {
 	/// Number of tokens in the prompt.
+	#[serde(default)]
 	pub prompt_tokens: u32,
 	/// Number of tokens in the generated completion.
+	#[serde(default)]
 	pub completion_tokens: u32,
 	/// Total number of tokens used in the request (prompt + completion).
+	#[serde(default)]
 	pub total_tokens: u32,
 	/// Breakdown of tokens used in a completion.
 	#[serde(skip_serializing_if = "Option::is_none")]
