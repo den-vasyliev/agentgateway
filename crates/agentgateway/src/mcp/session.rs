@@ -223,7 +223,9 @@ impl Session {
 		{
 			let merged_tx = merged_tx.clone();
 			// Parse the upstream response body back into ServerJsonRpcMessage items.
-			let content_encoding = upstream_resp.headers().typed_get::<headers::ContentEncoding>();
+			let content_encoding = upstream_resp
+				.headers()
+				.typed_get::<headers::ContentEncoding>();
 			let body = match crate::http::compression::decompress_body(
 				upstream_resp.into_body(),
 				content_encoding.as_ref(),
@@ -231,7 +233,10 @@ impl Session {
 				Ok((b, _)) => b,
 				Err(_) => {
 					self.server_tx.lock().expect("server_tx lock").take();
-					return Err(mcp::Error::SendError(None, "failed to decompress upstream GET body".to_string()).into());
+					return Err(
+						mcp::Error::SendError(None, "failed to decompress upstream GET body".to_string())
+							.into(),
+					);
 				},
 			};
 			let mut sse_stream = SseStream::from_byte_stream(body.into_data_stream());
@@ -443,7 +448,9 @@ impl Session {
 						// Wrap the upstream response to relay any server→client requests
 						// (e.g. sampling/createMessage) that arrive inline on the POST SSE stream.
 						let upstream_result = self.relay.send_single(r, ctx, service_name).await?;
-						self.relay_server_requests_from_response(upstream_result, &self.server_tx, &self.pending).await
+						self
+							.relay_server_requests_from_response(upstream_result, &self.server_tx, &self.pending)
+							.await
 					},
 					ClientRequest::GetPromptRequest(gpr) => {
 						let name = gpr.params.name.clone();
@@ -571,7 +578,9 @@ impl Session {
 		let server_tx = server_tx.clone();
 		let pending = pending.clone();
 
-		let content_encoding = upstream_resp.headers().typed_get::<headers::ContentEncoding>();
+		let content_encoding = upstream_resp
+			.headers()
+			.typed_get::<headers::ContentEncoding>();
 		let body = match crate::http::compression::decompress_body(
 			upstream_resp.into_body(),
 			content_encoding.as_ref(),
@@ -613,15 +622,13 @@ impl Session {
 					if forwarded {
 						// Register oneshot to receive the client's response.
 						let (resp_tx, resp_rx) = oneshot::channel::<ClientResult>();
-						pending.lock().expect("pending lock").insert(req_id.clone(), resp_tx);
+						pending
+							.lock()
+							.expect("pending lock")
+							.insert(req_id.clone(), resp_tx);
 
 						// Wait for the client to POST the response (up to 5 minutes).
-						match tokio::time::timeout(
-							std::time::Duration::from_secs(300),
-							resp_rx,
-						)
-						.await
-						{
+						match tokio::time::timeout(std::time::Duration::from_secs(300), resp_rx).await {
 							Ok(Ok(result)) => {
 								// Synthesize a response message and send it upstream (as the
 								// continuation of this SSE stream — the upstream server is reading
@@ -648,7 +655,9 @@ impl Session {
 						continue;
 					}
 					// No GET stream open; fall through and forward as-is (client can't handle it).
-					warn!("sampling/createMessage received but no GET stream is open — forwarding as notification");
+					warn!(
+						"sampling/createMessage received but no GET stream is open — forwarding as notification"
+					);
 				}
 
 				// Pass through Responses, Notifications, and unhandled Requests.
@@ -659,11 +668,9 @@ impl Session {
 		});
 
 		// Reconstruct an SSE Response from the out_rx channel.
-		let stream = tokio_stream::wrappers::ReceiverStream::new(out_rx).map(|msg| {
-			ServerSseMessage {
-				event_id: None,
-				message: Arc::new(msg),
-			}
+		let stream = tokio_stream::wrappers::ReceiverStream::new(out_rx).map(|msg| ServerSseMessage {
+			event_id: None,
+			message: Arc::new(msg),
 		});
 		Ok(sse_stream_response(stream, None))
 	}
