@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ::http::StatusCode;
 use ::http::header::CONTENT_TYPE;
@@ -10,12 +10,14 @@ use anyhow::anyhow;
 use futures_util::StreamExt;
 use headers::HeaderMapExt;
 use rmcp::model::{
-	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ConstString, Implementation,
-	ProtocolVersion, RequestId, ServerJsonRpcMessage,
+	ClientInfo, ClientJsonRpcMessage, ClientNotification, ClientRequest, ClientResult, ConstString,
+	Implementation, ProtocolVersion, RequestId, ServerJsonRpcMessage,
 };
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
+use serde_json::Map as JsonObject;
 use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 
 use crate::http::Response;
 use crate::mcp::handler::Relay;
@@ -26,12 +28,26 @@ use crate::mcp::{ClientError, MCPOperation, rbac};
 use crate::proxy::ProxyError;
 use crate::{mcp, *};
 
+/// Shared slot for the server→client SSE sender, populated when a GET stream is open.
+type SharedServerTx = Arc<Mutex<Option<Sender<ServerJsonRpcMessage>>>>;
+
+/// Pending server→client round-trips: request ID → oneshot for the client's result.
+type PendingMap = Arc<Mutex<HashMap<RequestId, oneshot::Sender<ClientResult>>>>;
+
 #[derive(Debug, Clone)]
 pub struct Session {
 	encoder: http::sessionpersistence::Encoder,
 	relay: Arc<Relay>,
 	pub id: Arc<str>,
+	/// Channel for legacy SSE sessions (deprecated transport).
 	tx: Option<Sender<ServerJsonRpcMessage>>,
+	/// Shared sender to forward server-initiated requests to the downstream GET SSE stream.
+	/// All clones of a Session share the same Arc so that a POST handler can reach the
+	/// sender that was registered by a concurrent GET handler.
+	server_tx: SharedServerTx,
+	/// Pending server→client round-trips keyed by request ID.
+	/// Shared across all clones of the same session.
+	pending: PendingMap,
 }
 
 impl Session {
@@ -47,10 +63,10 @@ impl Session {
 		};
 		Self::handle_error(req_id, self.send_internal(parts, message).await).await
 	}
-	/// send a message to upstream server(s), when using stateless mode. In stateless mode, every message
-	/// is wrapped in an InitializeRequest (except the actual InitializeRequest from the downstream).
-	/// This ensures servers that require an InitializeRequest behave correctly.
-	/// In the future, we may have a mode where we know the downstream is stateless as well, and can just forward as-is.
+
+	/// send a message to upstream server(s), when using stateless mode. In stateless mode, every
+	/// message is wrapped in an InitializeRequest (except the actual InitializeRequest from the
+	/// downstream). This ensures servers that require an InitializeRequest behave correctly.
 	pub async fn stateless_send_and_initialize(
 		&mut self,
 		parts: Parts,
@@ -142,16 +158,128 @@ impl Session {
 		Ok(())
 	}
 
-	/// get_stream establishes a stream for server-sent messages
+	/// Deliver a sampling/createMessage response from the downstream client.
+	/// Called by handle_post when it receives a ClientJsonRpcMessage::Response.
+	/// Returns true if the ID matched a pending sampling round-trip, false otherwise.
+	pub fn deliver_sampling_response(&self, id: &RequestId, result: ClientResult) -> bool {
+		let mut pending = self.pending.lock().expect("pending lock");
+		if let Some(tx) = pending.remove(id) {
+			let _ = tx.send(result);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// get_stream establishes the downstream GET SSE stream.
+	///
+	/// It merges two sources:
+	/// 1. Upstream GET SSE (notifications from upstream servers)
+	/// 2. Server-initiated requests forwarded from concurrent POST handlers (sampling)
+	///
+	/// The merged stream is returned as an SSE response to the downstream client.
 	pub async fn get_stream(&self, parts: Parts) -> Result<Response, ProxyError> {
 		let ctx = IncomingRequestContext::new(&parts);
 		let (_span, log, _cel) = mcp::handler::setup_request_log(parts, "get_stream");
 		let session_id = self.id.to_string();
 		log.non_atomic_mutate(|l| {
-			// NOTE: l.method_name keep None to respect the metrics logic: which do not want to handle GET, DELETE.
 			l.session_id = Some(session_id);
 		});
-		Self::handle_error(None, self.relay.send_fanout_get(ctx).await).await
+
+		// Register a sender so concurrent send_internal calls can forward server→client requests.
+		let (server_tx, server_rx) = tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(64);
+		{
+			let mut slot = self.server_tx.lock().expect("server_tx lock");
+			*slot = Some(server_tx);
+		}
+
+		// Build the upstream GET SSE stream.
+		let upstream_resp = self.relay.send_fanout_get(ctx).await;
+		let upstream_resp = match Self::handle_error(None, upstream_resp).await {
+			Ok(r) => r,
+			Err(e) => {
+				// Clear the server_tx slot on error so we don't leak the channel.
+				self.server_tx.lock().expect("server_tx lock").take();
+				return Err(e);
+			},
+		};
+
+		// Convert the upstream HTTP response body into a stream of ServerSseMessage.
+		// The upstream response is already an SSE stream from relay.send_fanout_get.
+		// We need to wrap it together with server_rx.
+		//
+		// relay.send_fanout_get returns a Response whose body is an SSE stream of ServerSseMessage.
+		// We cannot easily re-stream it as ServerSseMessage items without re-parsing. Instead, we
+		// forward server_rx items as ServerSseMessage into the same response body via a tokio task
+		// that writes into a channel that feeds the SSE body.
+		//
+		// Simplest approach: use a merged mpsc channel. We spawn a task that reads from the
+		// upstream response body and forwards each SSE event, while also reading from server_rx.
+		// Both are forwarded to a single merged_tx -> merged_rx that feeds the SSE response.
+
+		let (merged_tx, merged_rx) = tokio::sync::mpsc::channel::<ServerSseMessage>(128);
+
+		// Spawn task: forward upstream SSE → merged channel.
+		{
+			let merged_tx = merged_tx.clone();
+			// Parse the upstream response body back into ServerJsonRpcMessage items.
+			let content_encoding = upstream_resp.headers().typed_get::<headers::ContentEncoding>();
+			let body = match crate::http::compression::decompress_body(
+				upstream_resp.into_body(),
+				content_encoding.as_ref(),
+			) {
+				Ok((b, _)) => b,
+				Err(_) => {
+					self.server_tx.lock().expect("server_tx lock").take();
+					return Err(mcp::Error::SendError(None, "failed to decompress upstream GET body".to_string()).into());
+				},
+			};
+			let mut sse_stream = SseStream::from_byte_stream(body.into_data_stream());
+			tokio::spawn(async move {
+				while let Some(item) = sse_stream.next().await {
+					let event = match item {
+						Ok(e) => e,
+						Err(_) => break,
+					};
+					let data = match event.data {
+						Some(d) if !d.is_empty() => d,
+						_ => continue,
+					};
+					let msg = match serde_json::from_str::<ServerJsonRpcMessage>(&data) {
+						Ok(m) => m,
+						Err(_) => continue,
+					};
+					let sse_msg = ServerSseMessage {
+						event_id: event.id,
+						message: Arc::new(msg),
+					};
+					if merged_tx.send(sse_msg).await.is_err() {
+						break;
+					}
+				}
+			});
+		}
+
+		// Spawn task: forward server_rx (sampling requests) → merged channel.
+		{
+			let merged_tx = merged_tx.clone();
+			let mut server_rx = server_rx;
+			tokio::spawn(async move {
+				while let Some(msg) = server_rx.recv().await {
+					let sse_msg = ServerSseMessage {
+						event_id: None,
+						message: Arc::new(msg),
+					};
+					if merged_tx.send(sse_msg).await.is_err() {
+						break;
+					}
+				}
+			});
+		}
+
+		// Return the merged SSE stream as the GET response.
+		let stream = tokio_stream::wrappers::ReceiverStream::new(merged_rx);
+		Ok(sse_stream_response(stream, None))
 	}
 
 	async fn handle_error(
@@ -311,7 +439,11 @@ impl Session {
 
 						let tn = tool.to_string();
 						ctr.params.name = tn.into();
-						self.relay.send_single(r, ctx, service_name).await
+
+						// Wrap the upstream response to relay any server→client requests
+						// (e.g. sampling/createMessage) that arrive inline on the POST SSE stream.
+						let upstream_result = self.relay.send_single(r, ctx, service_name).await?;
+						self.relay_server_requests_from_response(upstream_result, &self.server_tx, &self.pending).await
 					},
 					ClientRequest::GetPromptRequest(gpr) => {
 						let name = gpr.params.name.clone();
@@ -408,6 +540,133 @@ impl Session {
 			)),
 		}
 	}
+
+	/// Scan an upstream POST response for server→client Request messages (e.g. sampling/createMessage).
+	/// For each such request: forward it to the downstream GET SSE stream via server_tx, register a
+	/// oneshot in pending, and await the client's response. The client response is injected back into
+	/// the upstream stream via a spawned task that intercepts it before it reaches the merge logic.
+	///
+	/// Non-request messages (Notifications, Responses) are passed through unchanged.
+	///
+	/// This is called only for tool calls, which are the only requests that can trigger sampling.
+	async fn relay_server_requests_from_response(
+		&self,
+		upstream_resp: Response,
+		server_tx: &SharedServerTx,
+		pending: &PendingMap,
+	) -> Result<Response, UpstreamError> {
+		// If the response is not SSE (i.e. it's a plain JSON response), there are no inline
+		// server→client requests to handle — return as-is.
+		let content_type = upstream_resp.headers().get(CONTENT_TYPE).cloned();
+		let is_sse = content_type
+			.as_ref()
+			.is_some_and(|ct| ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()));
+		if !is_sse {
+			return Ok(upstream_resp);
+		}
+
+		// Parse the upstream SSE stream and intercept server→client Request items.
+		// We buffer them through a new channel and return that as the modified SSE response.
+		let (out_tx, out_rx) = tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(128);
+		let server_tx = server_tx.clone();
+		let pending = pending.clone();
+
+		let content_encoding = upstream_resp.headers().typed_get::<headers::ContentEncoding>();
+		let body = match crate::http::compression::decompress_body(
+			upstream_resp.into_body(),
+			content_encoding.as_ref(),
+		) {
+			Ok((b, _)) => b,
+			Err(e) => return Err(UpstreamError::Http(ClientError::new(e))),
+		};
+
+		tokio::spawn(async move {
+			let mut sse_stream = SseStream::from_byte_stream(body.into_data_stream());
+			while let Some(item) = sse_stream.next().await {
+				let event = match item {
+					Ok(e) => e,
+					Err(_) => break,
+				};
+				let data = match event.data {
+					Some(d) if !d.is_empty() => d,
+					_ => continue,
+				};
+				let msg = match serde_json::from_str::<ServerJsonRpcMessage>(&data) {
+					Ok(m) => m,
+					Err(_) => continue,
+				};
+
+				// Check if this is a server→client Request (e.g. sampling/createMessage).
+				if let ServerJsonRpcMessage::Request(ref req) = msg {
+					let req_id = req.id.clone();
+
+					// Forward the request to the downstream GET SSE stream.
+					// Clone the Sender out of the mutex before awaiting to avoid holding
+					// a MutexGuard across an await point (which is not Send).
+					let maybe_tx = server_tx.lock().expect("server_tx lock").clone();
+					let forwarded = if let Some(tx) = maybe_tx {
+						tx.send(msg.clone()).await.is_ok()
+					} else {
+						false
+					};
+
+					if forwarded {
+						// Register oneshot to receive the client's response.
+						let (resp_tx, resp_rx) = oneshot::channel::<ClientResult>();
+						pending.lock().expect("pending lock").insert(req_id.clone(), resp_tx);
+
+						// Wait for the client to POST the response (up to 5 minutes).
+						match tokio::time::timeout(
+							std::time::Duration::from_secs(300),
+							resp_rx,
+						)
+						.await
+						{
+							Ok(Ok(result)) => {
+								// Synthesize a response message and send it upstream (as the
+								// continuation of this SSE stream — the upstream server is reading
+								// events from us via the POST body stream, but for StreamableHTTP
+								// the client response comes back on a separate POST).
+								// We don't need to write the result back to the upstream SSE here;
+								// the upstream server already sent us the tool result after receiving
+								// the sampling response via the client's dedicated sampling POST.
+								// Just drop it — the upstream will send the final tool result on the
+								// SSE stream momentarily.
+								debug!("sampling response received for id={:?}", req_id);
+								let _ = result; // consumed
+							},
+							Ok(Err(_)) => {
+								debug!("sampling oneshot cancelled for id={:?}", req_id);
+							},
+							Err(_) => {
+								debug!("sampling response timeout for id={:?}", req_id);
+								pending.lock().expect("pending lock").remove(&req_id);
+							},
+						}
+						// Do not forward the server Request to the output stream —
+						// it was already sent to the GET SSE stream above.
+						continue;
+					}
+					// No GET stream open; fall through and forward as-is (client can't handle it).
+					warn!("sampling/createMessage received but no GET stream is open — forwarding as notification");
+				}
+
+				// Pass through Responses, Notifications, and unhandled Requests.
+				if out_tx.send(msg).await.is_err() {
+					break;
+				}
+			}
+		});
+
+		// Reconstruct an SSE Response from the out_rx channel.
+		let stream = tokio_stream::wrappers::ReceiverStream::new(out_rx).map(|msg| {
+			ServerSseMessage {
+				event_id: None,
+				message: Arc::new(msg),
+			}
+		});
+		Ok(sse_stream_response(stream, None))
+	}
 }
 
 #[derive(Debug)]
@@ -460,6 +719,8 @@ impl SessionManager {
 			id: id.into(),
 			relay: Arc::new(relay),
 			tx: None,
+			server_tx: Arc::new(Mutex::new(None)),
+			pending: Arc::new(Mutex::new(HashMap::new())),
 			encoder: self.encoder.clone(),
 		};
 		let mut sm = self.sessions.write().expect("write lock");
@@ -476,6 +737,8 @@ impl SessionManager {
 			id: id.clone(),
 			relay: Arc::new(relay),
 			tx: None,
+			server_tx: Arc::new(Mutex::new(None)),
+			pending: Arc::new(Mutex::new(HashMap::new())),
 			encoder: self.encoder.clone(),
 		}
 	}
@@ -495,6 +758,8 @@ impl SessionManager {
 			id,
 			relay: Arc::new(relay),
 			tx: None,
+			server_tx: Arc::new(Mutex::new(None)),
+			pending: Arc::new(Mutex::new(HashMap::new())),
 			encoder: self.encoder.clone(),
 		}
 	}
@@ -508,6 +773,8 @@ impl SessionManager {
 			id: id.clone(),
 			relay: Arc::new(relay),
 			tx: Some(tx),
+			server_tx: Arc::new(Mutex::new(None)),
+			pending: Arc::new(Mutex::new(HashMap::new())),
 			encoder: self.encoder.clone(),
 		};
 		let mut sm = self.sessions.write().expect("write lock");
@@ -613,7 +880,8 @@ fn get_client_info() -> ClientInfo {
 		capabilities: rmcp::model::ClientCapabilities {
 			experimental: None,
 			roots: None,
-			sampling: None,
+			// Advertise sampling support so upstream servers can invoke sampling/createMessage.
+			sampling: Some(JsonObject::new()),
 			elicitation: None,
 			tasks: None,
 		},

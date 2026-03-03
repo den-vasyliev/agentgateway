@@ -123,13 +123,24 @@ impl StreamableHttpService {
 			.and_then(|v| v.to_str().ok());
 
 		if let Some(session_id) = session_id {
-			let Some(mut session) = self
+			let Some(session) = self
 				.session_manager
 				.get_or_resume_session(session_id, self.service_factory.clone())
 			else {
 				return mcp::Error::UnknownSession.into();
 			};
 
+			// Check if this is a sampling response (server→client round-trip result).
+			// The client sends a ClientJsonRpcMessage::Response to answer a sampling/createMessage
+			// request that arrived on its GET SSE stream. Route it to the waiting oneshot instead
+			// of forwarding upstream.
+			if let ClientJsonRpcMessage::Response(ref resp) = message
+				&& session.deliver_sampling_response(&resp.id, resp.result.clone())
+			{
+				return Ok(accepted_response());
+			}
+
+			let mut session = session;
 			return session.send(part, message).await;
 		}
 
