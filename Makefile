@@ -8,6 +8,7 @@ IMAGE_TAG ?= $(VERSION)
 IMAGE_FULL_NAME ?= $(DOCKER_REGISTRY)/$(DOCKER_REPO)/$(IMAGE_NAME):$(IMAGE_TAG)
 DOCKER_BUILDER ?= docker
 DOCKER_BUILD_ARGS ?= --build-arg VERSION=$(VERSION) --build-arg GIT_REVISION=$(GIT_REVISION)
+DOCKER_CACHE_DIR ?= /tmp/agentgateway-buildcache
 export PATH := ./tools:$(PATH)
 
 # docker
@@ -16,7 +17,10 @@ docker:
 ifeq ($(OS),Windows_NT)
 	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -f Dockerfile.windows -t $(IMAGE_FULL_NAME) .
 else
-	$(DOCKER_BUILDER) build $(DOCKER_BUILD_ARGS) -t $(IMAGE_FULL_NAME) . --progress=plain
+	$(DOCKER_BUILDER) buildx build $(DOCKER_BUILD_ARGS) -t $(IMAGE_FULL_NAME) \
+		--cache-from type=local,src=$(DOCKER_CACHE_DIR) \
+		--cache-to type=local,dest=$(DOCKER_CACHE_DIR),mode=max \
+		--load --progress=plain .
 endif
 
 .PHONY: docker-musl
